@@ -24,6 +24,7 @@ static const int FRAME_X = (SCREEN_W - FRAME_W) / 2;
 static const int FRAME_Y = 78;
 
 static const uint16_t BG_COLOR = TFT_BLACK;
+static const char APP_VERSION[] = "v1.0.0";
 
 static const uint16_t DELAY_UNIT_MS = 100;
 static const uint16_t MIN_FRAME_DELAY_MS = 15;
@@ -32,6 +33,7 @@ static const uint16_t FRAME_SPEEDUP_MS = 50;
 static const uint8_t FAST_FORWARD_DIVISOR = 16;
 static const uint16_t LONG_PRESS_MS = 700;
 static const uint32_t SAVE_POSITION_INTERVAL_MS = 5000;
+static const uint16_t FRAME_HISTORY_SIZE = 512;
 
 static const uint16_t TEXT_COLORS[] =
 {
@@ -52,13 +54,21 @@ TFT_eSprite sprite = TFT_eSprite(&tft);
 Preferences preferences;
 
 static uint32_t moviePos = 0;
+static uint32_t currentFrameStartPos = 0;
 static uint32_t currentMovieTimeMs = 0;
+static uint32_t currentFrameStartTimeMs = 0;
+static uint16_t frameHistoryIndex = 0;
+static uint16_t frameHistoryCount = 0;
+static uint32_t frameHistoryPos[FRAME_HISTORY_SIZE];
+static uint32_t frameHistoryTime[FRAME_HISTORY_SIZE];
 static uint32_t lastSavedMovieTimeMs = 0;
 static char frameLines[FRAME_LINES][FRAME_COLUMNS + 1];
 static bool movieStarted = false;
 static bool moviePaused = false;
 static bool movieFinished = false;
+static bool loopMode = false;
 static bool waitReleaseAfterLongPress = false;
+static bool welcomeLongPressConsumed = false;
 static bool buttonBFastMode = false;
 static uint8_t currentColorIndex = 0;
 static uint16_t currentTextColor = TFT_GREEN;
@@ -171,6 +181,10 @@ static void loadMoviePosition()
     moviePos = 0;
     currentMovieTimeMs = 0;
   }
+
+  currentFrameStartPos = moviePos;
+  currentFrameStartTimeMs = currentMovieTimeMs;
+  clearFrameHistory();
 }
 
 static void cycleTextColor()
@@ -265,7 +279,7 @@ static void drawIntroScreen()
   sprite.drawString("for LilyGo T-Display S3", SCREEN_W / 2, 90);
 
   sprite.drawString("Press any button to continue", SCREEN_W / 2, 128);
-  sprite.drawString("...", SCREEN_W / 2, 144);
+  sprite.drawString(APP_VERSION, SCREEN_W / 2, 144);
 
   sprite.pushSprite(0, 0);
 }
@@ -407,12 +421,137 @@ static void drawMovieFrame()
   sprite.pushSprite(0, 0);
 }
 
+
+static void clearFrameHistory()
+{
+  frameHistoryIndex = 0;
+  frameHistoryCount = 0;
+}
+
+static void addFrameHistory(uint32_t framePos, uint32_t frameTimeMs)
+{
+  if (frameHistoryCount > 0)
+  {
+    uint16_t lastIndex = (frameHistoryIndex + FRAME_HISTORY_SIZE - 1) % FRAME_HISTORY_SIZE;
+
+    if (frameHistoryPos[lastIndex] == framePos)
+    {
+      frameHistoryTime[lastIndex] = frameTimeMs;
+      return;
+    }
+  }
+
+  frameHistoryPos[frameHistoryIndex] = framePos;
+  frameHistoryTime[frameHistoryIndex] = frameTimeMs;
+
+  frameHistoryIndex = (frameHistoryIndex + 1) % FRAME_HISTORY_SIZE;
+
+  if (frameHistoryCount < FRAME_HISTORY_SIZE)
+  {
+    frameHistoryCount++;
+  }
+}
+
+static bool restoreFromHistory(uint32_t targetTimeMs)
+{
+  if (frameHistoryCount == 0)
+  {
+    return false;
+  }
+
+  bool found = false;
+  uint32_t bestTime = 0;
+  uint32_t bestPos = 0;
+
+  for (uint16_t i = 0; i < frameHistoryCount; i++)
+  {
+    if (frameHistoryTime[i] <= targetTimeMs && (!found || frameHistoryTime[i] > bestTime))
+    {
+      bestTime = frameHistoryTime[i];
+      bestPos = frameHistoryPos[i];
+      found = true;
+    }
+  }
+
+  if (!found)
+  {
+    return false;
+  }
+
+  moviePos = bestPos;
+  currentFrameStartPos = bestPos;
+  currentMovieTimeMs = bestTime;
+  currentFrameStartTimeMs = bestTime;
+  return true;
+}
+
+static bool skipNextFrame(uint32_t &frameDurationMs)
+{
+  uint32_t frameStartPos = moviePos;
+  uint16_t delayTicks = 0;
+  currentFrameStartPos = moviePos;
+  currentFrameStartTimeMs = currentMovieTimeMs;
+
+  if (!readDelayLine(delayTicks) || !readFrame())
+  {
+    return false;
+  }
+
+  frameDurationMs = frameDelayMs(delayTicks);
+  currentFrameStartPos = frameStartPos;
+  currentFrameStartTimeMs = currentMovieTimeMs;
+
+  addFrameHistory(frameStartPos, currentMovieTimeMs);
+
+  currentMovieTimeMs += frameDurationMs;
+  return true;
+}
+
+static bool seekForwardFromCurrent(uint32_t jumpMs)
+{
+  uint32_t targetTimeMs = currentMovieTimeMs + jumpMs;
+
+  while (movieAvailable() && currentMovieTimeMs < targetTimeMs)
+  {
+    uint32_t frameDurationMs = 0;
+
+    if (!skipNextFrame(frameDurationMs))
+    {
+      movieFinished = true;
+      return false;
+    }
+  }
+
+  return true;
+}
+
+static bool seekBackwardFromHistory(uint32_t jumpMs)
+{
+  uint32_t targetTimeMs = 0;
+
+  if (currentMovieTimeMs > jumpMs)
+  {
+    targetTimeMs = currentMovieTimeMs - jumpMs;
+  }
+
+  if (restoreFromHistory(targetTimeMs))
+  {
+    return true;
+  }
+
+  restartMovie();
+  return true;
+}
+
 static void restartMovie()
 {
   moviePos = 0;
+  currentFrameStartPos = 0;
   currentMovieTimeMs = 0;
+  currentFrameStartTimeMs = 0;
   lastSavedMovieTimeMs = 0;
   movieFinished = false;
+  clearFrameHistory();
   saveMoviePosition();
 }
 
@@ -435,56 +574,22 @@ static uint32_t frameDelayMs(uint16_t delayTicks)
 
 static bool seekMovieToTime(uint32_t targetTimeMs)
 {
-  uint32_t savedPos = moviePos;
-  uint32_t scanTimeMs = 0;
-
-  moviePos = 0;
-
-  while (movieAvailable())
+  if (targetTimeMs >= currentMovieTimeMs)
   {
-    uint32_t frameStartPos = moviePos;
-    uint16_t delayTicks = 0;
-
-    if (!readDelayLine(delayTicks) || !readFrame())
-    {
-      moviePos = savedPos;
-      return false;
-    }
-
-    uint32_t thisFrameMs = frameDelayMs(delayTicks);
-
-    if ((scanTimeMs + thisFrameMs) >= targetTimeMs)
-    {
-      moviePos = frameStartPos;
-      currentMovieTimeMs = scanTimeMs;
-      return true;
-    }
-
-    scanTimeMs += thisFrameMs;
+    return seekForwardFromCurrent(targetTimeMs - currentMovieTimeMs);
   }
 
-  restartMovie();
-  return true;
+  return restoreFromHistory(targetTimeMs);
 }
 
 static void jumpBackward()
 {
-  waitForButtonsReleased();
-
-  if (currentMovieTimeMs <= JUMP_TIME_MS)
-  {
-    seekMovieToTime(0);
-  }
-  else
-  {
-    seekMovieToTime(currentMovieTimeMs - JUMP_TIME_MS);
-  }
+  seekBackwardFromHistory(JUMP_TIME_MS);
 }
 
 static void jumpForward()
 {
-  waitForButtonsReleased();
-  seekMovieToTime(currentMovieTimeMs + JUMP_TIME_MS);
+  seekForwardFromCurrent(JUMP_TIME_MS);
 }
 
 static bool handleMovieButtons()
@@ -607,6 +712,7 @@ void loop()
       if (!isButtonPressed())
       {
         waitReleaseAfterLongPress = false;
+        welcomeLongPressConsumed = false;
       }
 
       delay(10);
@@ -615,15 +721,40 @@ void loop()
 
     if (isButtonPressed())
     {
-      waitForButtonsReleased();
+      uint32_t startMs = millis();
 
-      if (moviePos >= STAR_WARS_MOVIE_SIZE)
+      while (isButtonPressed())
       {
-        restartMovie();
+        if ((millis() - startMs) >= LONG_PRESS_MS)
+        {
+          loopMode = true;
+          welcomeLongPressConsumed = true;
+
+          if (moviePos >= STAR_WARS_MOVIE_SIZE)
+          {
+            restartMovie();
+          }
+
+          movieStarted = true;
+          return;
+        }
+
+        delay(5);
       }
 
-      movieStarted = true;
+      if (!welcomeLongPressConsumed)
+      {
+        loopMode = false;
+
+        if (moviePos >= STAR_WARS_MOVIE_SIZE)
+        {
+          restartMovie();
+        }
+
+        movieStarted = true;
+      }
     }
+
     delay(10);
     return;
   }
@@ -653,6 +784,7 @@ void loop()
           restartMovie();
           movieStarted = false;
           moviePaused = false;
+          loopMode = false;
           buttonBFastMode = false;
           waitReleaseAfterLongPress = true;
           drawIntroScreen();
@@ -692,16 +824,27 @@ void loop()
   }
 
   uint16_t delayTicks = 0;
+  currentFrameStartPos = moviePos;
+  currentFrameStartTimeMs = currentMovieTimeMs;
 
   if (!readDelayLine(delayTicks) || !readFrame())
   {
     restartMovie();
-    movieStarted = false;
     moviePaused = false;
     buttonBFastMode = false;
+
+    if (loopMode)
+    {
+      movieStarted = true;
+      return;
+    }
+
+    movieStarted = false;
     drawIntroScreen();
     return;
   }
+
+  addFrameHistory(currentFrameStartPos, currentFrameStartTimeMs);
 
   drawMovieFrame();
 
