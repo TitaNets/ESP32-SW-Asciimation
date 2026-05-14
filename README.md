@@ -35,6 +35,13 @@ USB connector facing RIGHT:
 | Long B | Temporary fast-forward while held |
 | Long A | Pause movie |
 
+On main screen:
+
+| Button | Action |
+|---|---|
+| Short A/B | Start movie once |
+| Long A/B | Start movie in continuous loop mode |
+
 While paused:
 
 | Button | Action |
