@@ -24,7 +24,7 @@ static const int FRAME_X = (SCREEN_W - FRAME_W) / 2;
 static const int FRAME_Y = 78;
 
 static const uint16_t BG_COLOR = TFT_BLACK;
-static const char APP_VERSION[] = "v1.0.0";
+static const char APP_VERSION[] = "v1.0.1";
 
 static const uint16_t DELAY_UNIT_MS = 100;
 static const uint16_t MIN_FRAME_DELAY_MS = 15;
@@ -70,6 +70,8 @@ static bool loopMode = false;
 static bool waitReleaseAfterLongPress = false;
 static bool welcomeLongPressConsumed = false;
 static bool buttonBFastMode = false;
+static bool blockFastForwardUntilBReleased = false;
+static bool blockPauseActionsUntilReleased = false;
 static uint8_t currentColorIndex = 0;
 static uint16_t currentTextColor = TFT_GREEN;
 
@@ -169,6 +171,12 @@ static void saveMoviePosition()
 {
   preferences.putUInt("moviePos", moviePos);
   preferences.putUInt("movieTime", currentMovieTimeMs);
+}
+
+static void resetStoredMoviePosition()
+{
+  preferences.putUInt("moviePos", 0);
+  preferences.putUInt("movieTime", 0);
 }
 
 static void loadMoviePosition()
@@ -552,7 +560,7 @@ static void restartMovie()
   lastSavedMovieTimeMs = 0;
   movieFinished = false;
   clearFrameHistory();
-  saveMoviePosition();
+  resetStoredMoviePosition();
 }
 
 static uint32_t frameDelayMs(uint16_t delayTicks)
@@ -589,7 +597,20 @@ static void jumpBackward()
 
 static void jumpForward()
 {
-  seekForwardFromCurrent(JUMP_TIME_MS);
+  uint32_t originalPos = moviePos;
+  uint32_t originalFramePos = currentFrameStartPos;
+  uint32_t originalTime = currentMovieTimeMs;
+  uint32_t originalFrameTime = currentFrameStartTimeMs;
+  bool originalFinished = movieFinished;
+
+  if (!seekForwardFromCurrent(JUMP_TIME_MS))
+  {
+    moviePos = originalPos;
+    currentFrameStartPos = originalFramePos;
+    currentMovieTimeMs = originalTime;
+    currentFrameStartTimeMs = originalFrameTime;
+    movieFinished = originalFinished;
+  }
 }
 
 static bool handleMovieButtons()
@@ -603,8 +624,8 @@ static bool handleMovieButtons()
       if ((millis() - startMs) >= LONG_PRESS_MS)
       {
         moviePaused = true;
+        blockPauseActionsUntilReleased = true;
         drawPauseScreen();
-        waitReleaseAfterLongPress = true;
         return true;
       }
 
@@ -651,6 +672,12 @@ static bool waitFrame(uint32_t waitMs)
 
     if (digitalRead(BUTTON_B_PIN) == LOW)
     {
+      if (blockFastForwardUntilBReleased)
+      {
+        delay(5);
+        continue;
+      }
+
       if (buttonBFastMode)
       {
         delay(5);
@@ -661,6 +688,12 @@ static bool waitFrame(uint32_t waitMs)
 
       while (digitalRead(BUTTON_B_PIN) == LOW)
       {
+        if (blockFastForwardUntilBReleased)
+        {
+          delay(5);
+          continue;
+        }
+
         if ((millis() - pressStartMs) >= LONG_PRESS_MS)
         {
           buttonBFastMode = true;
@@ -707,12 +740,13 @@ void loop()
 {
   if (!movieStarted)
   {
-    if (waitReleaseAfterLongPress)
+    if (waitReleaseAfterLongPress || blockPauseActionsUntilReleased)
     {
       if (!isButtonPressed())
       {
         waitReleaseAfterLongPress = false;
         welcomeLongPressConsumed = false;
+        blockPauseActionsUntilReleased = false;
       }
 
       delay(10);
@@ -729,6 +763,8 @@ void loop()
         {
           loopMode = true;
           welcomeLongPressConsumed = true;
+          buttonBFastMode = false;
+          blockFastForwardUntilBReleased = (digitalRead(BUTTON_B_PIN) == LOW);
 
           if (moviePos >= STAR_WARS_MOVIE_SIZE)
           {
@@ -742,17 +778,16 @@ void loop()
         delay(5);
       }
 
-      if (!welcomeLongPressConsumed)
+      loopMode = false;
+      buttonBFastMode = false;
+      blockFastForwardUntilBReleased = false;
+
+      if (moviePos >= STAR_WARS_MOVIE_SIZE)
       {
-        loopMode = false;
-
-        if (moviePos >= STAR_WARS_MOVIE_SIZE)
-        {
-          restartMovie();
-        }
-
-        movieStarted = true;
+        restartMovie();
       }
+
+      movieStarted = true;
     }
 
     delay(10);
@@ -765,14 +800,30 @@ void loop()
     {
       waitReleaseAfterLongPress = false;
     }
+  }
 
-    delay(10);
-    return;
+  if (blockFastForwardUntilBReleased)
+  {
+    if (digitalRead(BUTTON_B_PIN) != LOW)
+    {
+      blockFastForwardUntilBReleased = false;
+    }
   }
 
 
   if (moviePaused)
   {
+    if (blockPauseActionsUntilReleased)
+    {
+      if (!isButtonPressed())
+      {
+        blockPauseActionsUntilReleased = false;
+      }
+
+      delay(10);
+      return;
+    }
+
     if (digitalRead(BUTTON_A_PIN) == LOW)
     {
       uint32_t startMs = millis();
@@ -786,7 +837,8 @@ void loop()
           moviePaused = false;
           loopMode = false;
           buttonBFastMode = false;
-          waitReleaseAfterLongPress = true;
+          blockFastForwardUntilBReleased = false;
+          blockPauseActionsUntilReleased = true;
           drawIntroScreen();
           return;
         }
@@ -808,7 +860,7 @@ void loop()
         {
           cycleTextColor();
           drawPauseScreen();
-          waitReleaseAfterLongPress = true;
+          blockPauseActionsUntilReleased = true;
           return;
         }
 
@@ -851,7 +903,7 @@ void loop()
   uint32_t normalWaitMs = frameDelayMs(delayTicks);
   uint32_t waitMs = normalWaitMs;
 
-  if (buttonBFastMode)
+  if (buttonBFastMode && !blockFastForwardUntilBReleased)
   {
     if (digitalRead(BUTTON_B_PIN) == LOW)
     {
